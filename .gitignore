@@ -1,3 +1,6 @@
 /.idea/
 /venv/
-/__pycache__/
+/__pycache__/*
+modules/bg.png
+*/__pycache__/*
+*/*/__pycache__/*

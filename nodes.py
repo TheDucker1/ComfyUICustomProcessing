@@ -2,6 +2,8 @@
 import os
 from typing import Union, BinaryIO, Dict, List, Tuple, Optional
 import time
+import torch
+import numpy as np
 
 #  ComfyUI Modules
 import folder_paths
@@ -9,17 +11,246 @@ from comfy.utils import ProgressBar
 
 #  Your Modules
 from .modules.calculator import CalculatorModel
-
+from .modules.l0smoothing import L0Smooth
+from .modules.l1smoothing import L1Smooth
+from .modules.eap import EAP
 
 #  Basic practice to get paths from ComfyUI
 custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
-custom_nodes_model_dir = os.path.join(folder_paths.models_dir, "my-custom-nodes")
-custom_nodes_output_dir = os.path.join(folder_paths.get_output_directory(), "my-custom-nodes")
+#custom_nodes_model_dir = os.path.join(folder_paths.models_dir, "my-custom-nodes")
+#custom_nodes_output_dir = os.path.join(folder_paths.get_output_directory(), "my-custom-nodes")
 
 
 #  These are example nodes that only contains basic functionalities with some comments.
 #  If you need detailed explanation, please refer to : https://docs.comfy.org/essentials/custom_node_walkthrough
 #  First Node:
+
+class L0Smoother:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "is_grayscale": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "display": "slider",
+                }),
+                "_lambda": ("FLOAT", {
+                    "default": 2e-2,
+                    "min": 1e-3,
+                    "max": 1,
+                    "step": 1e-3,
+                }),
+                "_kappa": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 1.1,
+                    "max": 5.0,
+                    "step": 0.1,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_out",)
+    CATEGORY = "examples"
+    FUNCTION = "l0smooth"
+
+    def l0smooth(self, images, is_grayscale, _lambda, _kappa):
+        if _lambda is None:
+            _lambda = 2e-2
+        if _kappa is None:
+            _kappa = 2.0
+        L = []
+        images = images.cpu()
+        for i in range(images.shape[0]):
+            img = images[i].numpy().copy()
+            if is_grayscale:
+                img = img[:,:,0]
+            img = L0Smooth(img, _lambda, _kappa)
+            if is_grayscale:
+                if len(img.shape) < 3:
+                    img = img[:,:,np.newaxis]
+                img = np.repeat(img, 3, axis=2)
+            L.append(torch.from_numpy(img))
+        return (torch.stack(L, dim=0),)
+
+class L0SmootherEAP:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "iteration": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 20,
+                    "step": 1,
+                    "display": "number",
+                }),
+            },
+            "optional": {
+                "is_grayscale": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "display": "slider",
+                }),
+                "_lambda": ("FLOAT", {
+                    "default": 2e-2,
+                    "min": 1e-3,
+                    "max": 1,
+                    "step": 1e-3,
+                }),
+                "_kappa": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 1.1,
+                    "max": 5.0,
+                    "step": 0.1,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_out",)
+    CATEGORY = "examples"
+    FUNCTION = "l0smooth"
+
+    def l0smooth(self, images, iteration, is_grayscale, _lambda, _kappa):
+        if _lambda is None:
+            _lambda = 2e-2
+        if _kappa is None:
+            _kappa = 2.0
+        L = []
+        images = images.cpu()
+        SmoothFunc = lambda x, msk: L0Smooth(x, _lambda, _kappa, msk)
+        for i in range(images.shape[0]):
+            img = images[i].numpy().copy()
+            if is_grayscale:
+                img = img[:,:,0]
+            img = EAP(img, SmoothFunc, 0.1, iteration)
+            if is_grayscale:
+                if len(img.shape) < 3:
+                    img = img[:,:,np.newaxis]
+                img = np.repeat(img, 3, axis=2)
+            L.append(torch.from_numpy(img))
+        return (torch.stack(L, dim=0),)
+
+class L1Smoother:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "is_grayscale": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "display": "slider",
+                }),
+                "edge_preserving": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "display": "slider",
+                }),
+                "alpha": ("FLOAT", {
+                    "default": 50.0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 0.01,
+                }),
+                "beta": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 0.01,
+                }),
+                "gamma": ("FLOAT", {
+                    "default": 2.5,
+                    "min": 0,
+                    "max": 100,
+                    "step": 0.01,
+                }),
+                "_lambda": ("FLOAT", {
+                    "default": 5.0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 0.01,
+                }),
+                "maxIteration": ("INT", {
+                    "default": 5,
+                    "min": 0,
+                    "max": 100,
+                    "step": 1,
+                }),
+                "kappa": ("FLOAT", {
+                    "default": 3.0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 0.01,
+                }),
+                "sigma": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 0.1,
+                }),
+                "half_window": ("INT", {
+                    "default": 3,
+                    "min": 0,
+                    "max": 7,
+                    "step": 1,
+                }),
+                "eta": ("FLOAT", {
+                    "default": 15.0,
+                    "min": 0,
+                    "max": 100,
+                    "step": 0.01,
+                }),
+                "global_size": ("INT", {
+                    "default": 20,
+                    "min": 1,
+                    "max": 100,
+                    "step": 1,
+                }),
+                "threshold": ("FLOAT", {
+                    "default": 0.1,
+                    "min": 0,
+                    "max": 10,
+                    "step": 0.001,
+                }),
+            }
+        }
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_out",)
+    CATEGORY = "examples"
+    FUNCTION = "l1smooth"
+
+    def l1smooth(self, images, is_grayscale, edge_preserving, alpha, beta, gamma, _lambda, maxIteration, kappa, sigma, half_window, eta, global_size, threshold):
+        images = images.cpu()
+        L = []
+        for i in range(images.shape[0]):
+            img = images[i].numpy().copy()
+            if is_grayscale:
+                img = img[:,:,0]
+            img = L1Smooth(img, alpha, beta, gamma, _lambda, maxIteration, kappa, sigma, half_window, eta, edge_preserving, global_size, threshold)
+            if is_grayscale:
+                if len(img.shape) < 3:
+                    img = img[:,:,np.newaxis]
+                img = np.repeat(img, 3, axis=2)
+            L.append(torch.from_numpy(img))
+        return (torch.stack(L, dim=0),)
+
 class MyModelLoader:
     #  Define the input parameters of the node here.
     @classmethod
@@ -69,7 +300,6 @@ class MyModelLoader:
 
         #  Return the model as a tuple.
         return (calculator_model, )
-
 
 #  Second Node
 class CalculatePlus:
