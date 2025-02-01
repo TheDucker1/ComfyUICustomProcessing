@@ -14,6 +14,7 @@ from .modules.calculator import CalculatorModel
 from .modules.l0smoothing import L0Smooth
 from .modules.l1smoothing import L1Smooth
 from .modules.rtv import tsmooth
+from .modules.guidedfilter import GuidedFilter
 from .modules.eap import EAP
 
 #  Basic practice to get paths from ComfyUI
@@ -315,6 +316,74 @@ class RTVSmoother:
             if is_grayscale:
                 img = img[:,:,0]
             img = tsmooth(img, _lambda, sigma, sharpness, maxIteration)
+            if is_grayscale:
+                if len(img.shape) < 3:
+                    img = img[:,:,np.newaxis]
+                img = np.repeat(img, 3, axis=2)
+            L.append(torch.from_numpy(img))
+        return (torch.stack(L, dim=0),)
+
+class GuidedFilterer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "is_grayscale": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "display": "slider",
+                }),
+                "guides": ("IMAGE",),
+                "is_grayscale_guides": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "display": "slider",
+                }),
+                "radius": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "display": "number",
+                }),
+                "epsilon": ("FLOAT", {
+                    "default": 0.4,
+                    "min": 0.01,
+                    "max": 10.0,
+                    "step": 0.01,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_out",)
+    CATEGORY = "examples"
+    FUNCTION = "guidedfilter"
+
+    def guidedfilter(self, images, is_grayscale, guides = None, is_grayscale_guides = 0, radius = 5, epsilon = 0.4):
+        images = images.cpu()
+        if guides is not None:
+            guides = guides.cpu()
+        L = []
+        for i in range(images.shape[0]):
+            img = images[i].numpy().copy()
+            if is_grayscale:
+                img = img[:,:,0]
+            if guides is not None:
+                guide = guides[i].numpy().copy()
+                if is_grayscale_guides:
+                    guide = guide[:,:,0]
+                filt = GuidedFilter(guide, radius, epsilon)
+            else:
+                filt = GuidedFilter(img, radius, epsilon)
+            img = filt.filter(img)
             if is_grayscale:
                 if len(img.shape) < 3:
                     img = img[:,:,np.newaxis]
