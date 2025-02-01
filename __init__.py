@@ -8,6 +8,8 @@ NODE_CLASS_MAPPINGS = {
     "L1 Smoothing": L1Smoother,
     "RTV Smoothing": RTVSmoother,
     "Guided Filter": GuidedFilterer,
+    "MangaLine Model Loader": MangaLineExtractionModelLoader,
+    "MangaLine Extraction": MangaLineExtraction,
 #    "(Down)Load My Model": MyModelLoader,
 #    "Calculate Plus": CalculatePlus,
 #    "Calculate Minus": CalculateMinus,

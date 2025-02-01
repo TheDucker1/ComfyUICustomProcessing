@@ -15,10 +15,12 @@ from .modules.l0smoothing import L0Smooth
 from .modules.l1smoothing import L1Smooth
 from .modules.rtv import tsmooth
 from .modules.guidedfilter import GuidedFilter
+from .modules.mangalineextractionmodel import MangaLineExtract, MangaLineModelLoad
 from .modules.eap import EAP
 
 #  Basic practice to get paths from ComfyUI
 custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
+
 #custom_nodes_model_dir = os.path.join(folder_paths.models_dir, "my-custom-nodes")
 #custom_nodes_output_dir = os.path.join(folder_paths.get_output_directory(), "my-custom-nodes")
 
@@ -26,6 +28,39 @@ custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
 #  These are example nodes that only contains basic functionalities with some comments.
 #  If you need detailed explanation, please refer to : https://docs.comfy.org/essentials/custom_node_walkthrough
 #  First Node:
+
+folder_paths.add_model_folder_path('extra', os.path.join(folder_paths.models_dir, 'extra'))
+
+class MangaLineExtractionModelLoader():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            
+        }
+    RETURN_TYPES = ("MANGA_LINE_MODEL",)
+    RETURN_NAMES = ("model",)
+    CATEGORY = "examples"
+    FUNCTION = "modelload"
+
+    def modelload(self):
+        model_full_path = folder_paths.get_full_path_or_raise('extra', 'erika.pth')
+        return (MangaLineModelLoad(model_full_path),)
+class MangaLineExtraction():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "model": ("MANGA_LINE_MODEL",),
+            }
+        }
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_out",)
+    CATEGORY = "examples"
+    FUNCTION = "modelrun"
+
+    def modelrun(self, images, model):
+        return (MangaLineExtract(images, model),)
 
 class L0Smoother:
     @classmethod
