@@ -1,6 +1,7 @@
 # get model here https://github.com/ljsabc/MangaLineExtraction_PyTorch
 
 import torch
+from torchvision.transforms.functional import rgb_to_grayscale
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -252,7 +253,7 @@ class MangaLineExtractionModel(nn.Module):
 def MangaLineExtract(img_batch, model):
     B, H, W, C = img_batch.shape
     if C == 3:
-        img_batch = img_batch[:,:,:,0].unsqueeze(1)
+        img_batch = rgb_to_grayscale(img_batch.permute(0,3,1,2))
     else:
         img_batch = img_batch.permute(0,3,1,2)
     padW = (16 - W%16)%16
