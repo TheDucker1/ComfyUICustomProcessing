@@ -6,6 +6,7 @@ NODE_CLASS_MAPPINGS = {
     "L0 Smoothing": L0Smoother,
     "L0 Smoothing (EAP)": L0SmootherEAP,
     "L1 Smoothing": L1Smoother,
+    "RTV Smoothing": RTVSmoother,
 #    "(Down)Load My Model": MyModelLoader,
 #    "Calculate Plus": CalculatePlus,
 #    "Calculate Minus": CalculateMinus,

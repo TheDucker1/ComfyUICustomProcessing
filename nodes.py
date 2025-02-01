@@ -13,6 +13,7 @@ from comfy.utils import ProgressBar
 from .modules.calculator import CalculatorModel
 from .modules.l0smoothing import L0Smooth
 from .modules.l1smoothing import L1Smooth
+from .modules.rtv import tsmooth
 from .modules.eap import EAP
 
 #  Basic practice to get paths from ComfyUI
@@ -244,6 +245,76 @@ class L1Smoother:
             if is_grayscale:
                 img = img[:,:,0]
             img = L1Smooth(img, alpha, beta, gamma, _lambda, maxIteration, kappa, sigma, half_window, eta, edge_preserving, global_size, threshold)
+            if is_grayscale:
+                if len(img.shape) < 3:
+                    img = img[:,:,np.newaxis]
+                img = np.repeat(img, 3, axis=2)
+            L.append(torch.from_numpy(img))
+        return (torch.stack(L, dim=0),)
+
+class RTVSmoother:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "is_grayscale": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 1,
+                    "step": 1,
+                    "display": "slider",
+                }),
+                "_lambda": ("FLOAT", {
+                    "default": 0.01,
+                    "min": 0.001,
+                    "max": 10.0,
+                    "step": 0.001,
+                }),
+                "sigma": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.1,
+                    "max": 5.0,
+                    "step": 0.01,
+                }),
+                "sharpness": ("FLOAT", {
+                    "default": 0.02,
+                    "min": 0.001,
+                    "max": 10.0,
+                    "step": 0.001,
+                }),
+                "maxIteration": ("INT", {
+                    "default": 4,
+                    "min": 1,
+                    "max": 100,
+                    "step": 1
+                })
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_out",)
+    CATEGORY = "examples"
+    FUNCTION = "rtvsmooth"
+
+    def rtvsmooth(self, images, is_grayscale, _lambda, sigma, sharpness, maxIteration):
+        if _lambda is None:
+            _lambda = 0.01
+        if sigma is None:
+            sigma = 3.0
+        if sharpness is None:
+            sharpness = 0.02
+        if maxIteration is None:
+            maxIteration = 4
+        L = []
+        images = images.cpu()
+        for i in range(images.shape[0]):
+            img = images[i].numpy().copy()
+            if is_grayscale:
+                img = img[:,:,0]
+            img = tsmooth(img, _lambda, sigma, sharpness, maxIteration)
             if is_grayscale:
                 if len(img.shape) < 3:
                     img = img[:,:,np.newaxis]
