@@ -10,6 +10,8 @@ NODE_CLASS_MAPPINGS = {
     "Guided Filter": GuidedFilterer,
     "MangaLine Model Loader": MangaLineExtractionModelLoader,
     "MangaLine Extraction": MangaLineExtraction,
+    "DanbooRegion Model Loader": DanbooRegionModelLoader,
+    "DanbooRegion Segmentator": DanbooRegionSegmentator,
 #    "(Down)Load My Model": MyModelLoader,
 #    "Calculate Plus": CalculatePlus,
 #    "Calculate Minus": CalculateMinus,

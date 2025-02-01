@@ -2,3 +2,4 @@
 #  numpy==1.18.1
 
 numba
+h5py
