@@ -17,6 +17,7 @@ from .modules.rtv import tsmooth
 from .modules.guidedfilter import GuidedFilter
 from .modules.mangalineextractionmodel import MangaLineExtract, MangaLineModelLoad
 from .modules.danbooregion import DanbooRegionLoadModel, DanbooRegionGetRegion
+from .modules.maskboundingbox import MaskBoundingBoxExtract
 from .modules.eap import EAP
 
 #  Basic practice to get paths from ComfyUI
@@ -76,6 +77,82 @@ class MangaLineExtraction():
 
     def modelrun(self, images, model):
         return (MangaLineExtract(images, model),)
+    
+class BoundingBoxFromMask():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "masks": ("MASK",),
+            }
+        }
+    RETURN_TYPES = ("INT","INT","INT","INT",)
+    RETURN_NAMES = ("X", "Y", "W", "H",)
+    CATEGORY = "examples"
+    FUNCTION = "bbox"
+
+    def bbox(self, masks):
+        if len(masks.shape) == 4:
+            masks = masks[0,:,:,0]
+        elif len(masks.shape) == 3:
+            masks = masks[0]
+        x,y,w,h = MaskBoundingBoxExtract(masks.numpy())
+        return (x,y,w,h,)
+
+class ImagePadReflect():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "curX": ("INT",),
+                "curY": ("INT",),
+                "curW": ("INT",),
+                "curH": ("INT",),
+                "desiredW": ("INT",),
+                "desiredH": ("INT",),
+            }
+        }
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image_out",)
+    CATEGORY = "examples"
+    FUNCTION = "padimg"
+
+    def padimg(self, images, curX, curY, curW, curH, desiredW, desiredH):
+        assert(desiredW >= curX + curW)
+        assert(desiredH >= curY + curH)
+
+        while curX or desiredW - curX - curW or curY or desiredH - curY - curH:
+            padL = min(curX, images.shape[2]-1)
+            padR = min(desiredW-curX-curW, images.shape[2]-1)
+            padU = min(curY, images.shape[1]-1)
+            padD = min(desiredH-curY-curH, images.shape[1]-1)
+            print(padL, padR, padU, padD)
+            pad_arr = (0, 0, padL, padR, padU, padD)
+            curX -= padL
+            curY -= padU
+            curW += padL+padR
+            curH += padU+padD
+            images = torch.nn.functional.pad(images, pad_arr, 'reflect')
+        return (images,)
+    
+class ImageSizeGet():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+            }
+        }
+    RETURN_TYPES = ("INT","INT",)
+    RETURN_NAMES = ("W", "H",)
+    CATEGORY = "examples"
+    FUNCTION = "getsize"
+    
+    def getsize(self, images):
+        W = images.shape[2]
+        H = images.shape[1]
+        return (W,H,)
 
 class DanbooRegionSegmentator():
     @classmethod
