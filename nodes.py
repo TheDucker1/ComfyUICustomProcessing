@@ -127,7 +127,6 @@ class ImagePadReflect():
             padR = min(desiredW-curX-curW, images.shape[2]-1)
             padU = min(curY, images.shape[1]-1)
             padD = min(desiredH-curY-curH, images.shape[1]-1)
-            print(padL, padR, padU, padD)
             pad_arr = (0, 0, padL, padR, padU, padD)
             curX -= padL
             curY -= padU
