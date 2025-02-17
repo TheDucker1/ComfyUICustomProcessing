@@ -125,54 +125,6 @@ MAPPING = {
     'op': ('conv',)
 }
 
-def d_resize(x, d, fac=1.0):
-    new_min = min(int(d[1] * fac), int(d[0] * fac))
-    raw_min = min(x.shape[0], x.shape[1])
-    if new_min < raw_min:
-        interpolation = cv2.INTER_AREA
-    else:
-        interpolation = cv2.INTER_LANCZOS4
-    y = cv2.resize(x, (int(d[1] * fac), int(d[0] * fac)), interpolation=interpolation)
-    return y
-def min_resize(x, m):
-    if x.shape[0] < x.shape[1]:
-        s0 = m
-        s1 = int(float(m) / float(x.shape[0]) * float(x.shape[1]))
-    else:
-        s0 = int(float(m) / float(x.shape[1]) * float(x.shape[0]))
-        s1 = m
-    new_max = max(s1, s0)
-    raw_max = max(x.shape[0], x.shape[1])
-    if new_max < raw_max:
-        interpolation = cv2.INTER_AREA
-    else:
-        interpolation = cv2.INTER_LANCZOS4
-    y = cv2.resize(x, (s1, s0), interpolation=interpolation)
-    return y
-def mk_resize(x, k):
-    if x.shape[0] < x.shape[1]:
-        s0 = k
-        s1 = int(x.shape[1] * (k / x.shape[0]))
-        s1 = s1 - s1 % 128
-        _s0 = 32 * s0
-        _s1 = int(x.shape[1] * (_s0 / x.shape[0]))
-        _s1 = (_s1 + 64) - (_s1 + 64) % 128
-    else:
-        s1 = k
-        s0 = int(x.shape[0] * (k / x.shape[1]))
-        s0 = s0 - s0 % 128
-        _s1 = 32 * s1
-        _s0 = int(x.shape[0] * (_s1 / x.shape[1]))
-        _s0 = (_s0 + 64) - (_s0 + 64) % 128
-    new_min = min(_s1, _s0)
-    raw_min = min(x.shape[0], x.shape[1])
-    if new_min < raw_min:
-        interpolation = cv2.INTER_AREA
-    else:
-        interpolation = cv2.INTER_LANCZOS4
-    y = cv2.resize(x, (_s1, _s0), interpolation=interpolation)
-    return y
-
 def count_all(labeled_array: np.ndarray, all_counts):
     a = labeled_array.copy() - 1
     for i in range(len(all_counts)):
@@ -367,25 +319,13 @@ class DanbooRegion():
                     I = I[:,padL:,:]
                     ww = ww[:,padL:,:]
                 img4[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :] = I
-                w4[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :] = ww
-                
-        cv2.imwrite("w2.png", (w2*255).clip(0,255).astype(np.uint8))
-        cv2.imwrite("w3.png", (w3*255).clip(0,255).astype(np.uint8))
-        cv2.imwrite("w4.png", (w4*255).clip(0,255).astype(np.uint8))
-                
-        cv2.imwrite("2.png", (img2*255).clip(0,255).astype(np.uint8))
-        cv2.imwrite("3.png", (img3*255).clip(0,255).astype(np.uint8))
-        cv2.imwrite("4.png", (img4*255).clip(0,255).astype(np.uint8))
-        
+                w4[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :] = ww        
         
         return ((img2*w2+img3*w3+img4*w4)/(w2+w3+w4))[:H,:W,0]
     
     def __call__(self, x):
         raw_img = (x.copy()*255).clip(0,255).astype(np.uint8)
         height = self.go_process(raw_img) * 255
-        cv2.imwrite("test.png", height.clip(0,255).astype(np.uint8))
-        #height = d_resize(self.go_transposed_vector(mk_resize(min_resize(raw_img, 512), 32)), raw_img.shape) * 255.0
-        #cv2.imwrite("test2.png", height.clip(0,255).astype(np.uint8))
         height += (height - cv2.GaussianBlur(height, (0,0), 3.0)) * 10.0
         marker = height.clip(0, 255).astype(np.uint8)
         marker[marker>135]=255
