@@ -308,9 +308,84 @@ class DanbooRegion():
         b = np.transpose(self.go_flipped_vector(np.transpose(x, [1, 0, 2])), [1, 0, 2])
         return (a + b) / 2.0
     
+    def go_process(self, img):
+        img = img.copy()
+        H, W = img.shape[:2]
+        padw = (512 - W % 512) % 512
+        padh = (512 - H % 512) % 512
+        img = cv2.copyMakeBorder(img, 0, padh, 0, padw, cv2.BORDER_REFLECT_101)
+        img2 = np.zeros((img.shape[0], img.shape[1], 1), dtype=np.float32)
+        
+        # linear weight
+        Weight = (np.arange(256) + 1) / 512
+        Weight = np.concatenate([Weight, Weight[::-1]])
+        Weight = Weight[np.newaxis, :]
+        WeightHorizontal = np.repeat(Weight, 512, axis=0)
+        WeightVertical = cv2.rotate(WeightHorizontal, cv2.ROTATE_90_CLOCKWISE)
+        Weight = np.minimum(WeightHorizontal, WeightVertical)
+        Weight = Weight[:,:,np.newaxis]
+        w2 = img2.copy()
+        w3 = img2.copy()
+        w4 = img2.copy()
+        
+        for i in range(0, img.shape[0], 512):
+            for j in range(0, img.shape[1], 512):
+                img2[i:i+512, j:j+512, :] = self.go_transposed_vector(img[i:i+512,j:j+512,:])
+                w2[i:i+512, j:j+512, :] = Weight
+
+        img3 = img2.copy()
+        img4 = img2.copy()
+        for i in range(-256, img.shape[0] + 256, 512):
+            for j in range(0, img.shape[1], 512):
+                I = img[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :]
+                padU = 256 if i < 0 else 0
+                padD = 256 if i + 256 == img.shape[0] else 0
+                I = cv2.copyMakeBorder(I, padU, padD, 0, 0, cv2.BORDER_REFLECT_101)
+                I = self.go_transposed_vector(I)
+                ww = Weight.copy()
+                if padD:
+                    I = I[padU:-padD,:,:]
+                    ww = ww[padU:-padD,:,:]
+                else:
+                    I = I[padU:,:,:]
+                    ww = ww[padU:,:,:]
+                img3[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :] = I
+                w3[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :] = ww
+                
+        for i in range(0, img.shape[0], 512):
+            for j in range(-256, img.shape[1] + 256, 512):
+                I = img[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :]
+                padL = 256 if j < 0 else 0
+                padR = 256 if j + 256 == img.shape[1] else 0
+                I = cv2.copyMakeBorder(I, 0, 0, padL, padR, cv2.BORDER_REFLECT_101)
+                I = self.go_transposed_vector(I)
+                ww = Weight.copy()
+                if padR:
+                    I = I[:,padL:-padR,:]
+                    ww = ww[:,padL:-padR,:]
+                else:
+                    I = I[:,padL:,:]
+                    ww = ww[:,padL:,:]
+                img4[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :] = I
+                w4[max(i,0):min(i+512,img.shape[0]), max(j,0):min(j+512,img.shape[1]), :] = ww
+                
+        cv2.imwrite("w2.png", (w2*255).clip(0,255).astype(np.uint8))
+        cv2.imwrite("w3.png", (w3*255).clip(0,255).astype(np.uint8))
+        cv2.imwrite("w4.png", (w4*255).clip(0,255).astype(np.uint8))
+                
+        cv2.imwrite("2.png", (img2*255).clip(0,255).astype(np.uint8))
+        cv2.imwrite("3.png", (img3*255).clip(0,255).astype(np.uint8))
+        cv2.imwrite("4.png", (img4*255).clip(0,255).astype(np.uint8))
+        
+        
+        return ((img2*w2+img3*w3+img4*w4)/(w2+w3+w4))[:H,:W,0]
+    
     def __call__(self, x):
         raw_img = (x.copy()*255).clip(0,255).astype(np.uint8)
-        height = d_resize(self.go_transposed_vector(mk_resize(min_resize(raw_img, 512), 32)), raw_img.shape) * 255.0
+        height = self.go_process(raw_img) * 255
+        cv2.imwrite("test.png", height.clip(0,255).astype(np.uint8))
+        #height = d_resize(self.go_transposed_vector(mk_resize(min_resize(raw_img, 512), 32)), raw_img.shape) * 255.0
+        #cv2.imwrite("test2.png", height.clip(0,255).astype(np.uint8))
         height += (height - cv2.GaussianBlur(height, (0,0), 3.0)) * 10.0
         marker = height.clip(0, 255).astype(np.uint8)
         marker[marker>135]=255
@@ -368,7 +443,7 @@ def DanbooRegionGetRegion(img, model, rand_colour = False):
 
 if __name__ == '__main__':
     model = DanbooRegionLoadModel('../../../models/extra/DanbooRegion2020UNet.net')
-    img = cv2.imread('bg.png', cv2.IMREAD_COLOR)
+    img = cv2.imread('bg2.jpg', cv2.IMREAD_COLOR)
     S = img.astype(np.float32) / 255.
     img2 = (DanbooRegionGetRegion(S, model) * 255).clip(0,255).astype(np.uint8)
     cv2.imshow('1', img)
