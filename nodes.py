@@ -19,6 +19,7 @@ from .modules.mangalineextractionmodel import MangaLineExtract, MangaLineModelLo
 from .modules.danbooregion import DanbooRegionLoadModel, DanbooRegionGetRegion
 from .modules.maskboundingbox import MaskBoundingBoxExtract
 from .modules.eap import EAP
+from .modules.MEMatte import CreateMEMatteS, CreateMEMatteB
 
 #  Basic practice to get paths from ComfyUI
 custom_nodes_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +61,44 @@ class DanbooRegionModelLoader():
     def modelload(self):
         model_full_path = folder_paths.get_full_path_or_raise('extra', 'DanbooRegion2020UNet.net')
         return (DanbooRegionLoadModel(model_full_path),)
+class MEMatteModelLoader():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_type": (["Small", "Base"],),
+                "max_number_token": ("INT", {
+                    'default': 18500,
+                    'min': 1,
+                    'max': 18500,
+                    'step': 1
+                }),
+            }
+        }
+    RETURN_TYPES = ("MEMATTE_MODEL",)
+    RETURN_NAMES = ("model",)
+    CATEGORY = "examples"
+    FUNCTION = "modelload"
+
+    def modelload(self, model_type, max_number_token):
+        assert(model_type in ("Small", "Base"))
+        if model_type == "Small":
+            model_full_path = folder_paths.get_full_path_or_raise('extra', 'MEMatte_ViTS_DIM.pth')
+        elif model_type == 'Base':
+            model_full_path = folder_paths.get_full_path_or_raise('extra', 'MEMatte_ViTB_DIM.pth')
+        else:
+            assert False, 'model must be in ("Small", "Base")'
+        assert max_number_token > 0
+        if max_number_token > 18500: # cap here
+            max_number_token = 18500
+        if model_type == "Small":
+            Loaded = CreateMEMatteS(max_number_token)
+        else:
+            Loaded = CreateMEMatteB(max_number_token)
+        weights = torch.load(model_full_path, map_location=torch.device('cpu'))
+        Loaded.load_state_dict(weights)
+        
+        return (Loaded,)
 
 class MangaLineExtraction():
     @classmethod
@@ -77,6 +116,43 @@ class MangaLineExtraction():
 
     def modelrun(self, images, model):
         return (MangaLineExtract(images, model),)
+class MEMatteFixMatt():
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "model": ("MEMATTE_MODEL",),
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask_out",)
+    CATEGORY = "examples"
+    FUNCTION = "modelrun"
+    
+    def modelrun(self, images, model, mask=None):
+        print(images.shape)
+        B,H,W,C = images.shape
+        if C == 4 and mask == None:
+            mask = images[:,:,:,3]
+            mask = mask.view(B,H,W,1).permute(0,3,1,2)
+        else:
+            if mask is None:
+                assert False, 'expecting mask in image or input mask'
+            print(mask.shape)
+            if len(mask.shape) < 4:
+                mask = mask.view(B,1,H,W)
+        if C == 4: #drop mask
+            images = images[:,:,:,:3]
+        data = {
+            'image': images.permute(0,3,1,2),
+            'trimap': mask
+        }
+        output, _, _ = model(data)
+        return (output['phas'],)
     
 class BoundingBoxFromMask():
     @classmethod

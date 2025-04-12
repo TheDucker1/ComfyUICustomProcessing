@@ -12,6 +12,8 @@ NODE_CLASS_MAPPINGS = {
     "MangaLine Extraction": MangaLineExtraction,
     "DanbooRegion Model Loader": DanbooRegionModelLoader,
     "DanbooRegion Segmentator": DanbooRegionSegmentator,
+    "MEMatte Model Loader": MEMatteModelLoader,
+    "MEMatte Fix Alpha": MEMatteFixMatt,
     "Extract Bounding Box From Mask": BoundingBoxFromMask,
     "Image Reflection Pad": ImagePadReflect,
     "Get Image Size": ImageSizeGet,
