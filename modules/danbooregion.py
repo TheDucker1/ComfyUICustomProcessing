@@ -383,10 +383,39 @@ def DanbooRegionGetRegion(img, model, rand_colour = False):
 
 if __name__ == '__main__':
     model = DanbooRegionLoadModel('../../../models/extra/DanbooRegion2020UNet.net')
-    img = cv2.imread('bg2.jpg', cv2.IMREAD_COLOR)
-    S = img.astype(np.float32) / 255.
-    img2 = (DanbooRegionGetRegion(S, model) * 255).clip(0,255).astype(np.uint8)
-    cv2.imshow('1', img)
-    cv2.imshow('2', img2)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    img = cv2.imread('00009-1104080113.png', cv2.IMREAD_COLOR)
+    img2 = cv2.imread('06.jpg', cv2.IMREAD_GRAYSCALE)
+    hh, ww = img2.shape[:2]
+    def resize_crop(hh, ww, h2, w2):
+        ratio_h = hh / h2
+        ratio_w = ww / w2
+        if ratio_h > ratio_w:
+            w3 = ww
+            h3 = int(h2 * ratio_w)
+        else:
+            h3 = hh
+            w3 = int(w2 * ratio_h)
+        return h3, w3
+    h2, w2 = resize_crop(hh, ww, 1152, 896)
+    
+    I = img.astype(np.float32) / 255.
+    R = DanbooRegionGetRegion(I, model).clip(0, 1)
+    
+    iMult = (I / (R + 1e-6)).clip(0, 1)
+    iScr = 1 - ((1 - I) / (1 - R * iMult + 1e-6)).clip(0,1)
+    
+    R = cv2.resize(R, (w2,h2))
+    iMult = cv2.resize(iMult, (w2,h2))
+    iScr = cv2.resize(iScr, (w2,h2))
+    
+    cv2.imwrite('iR.png', (R*255).astype(np.uint8))
+    cv2.imwrite('iMult.png', (iMult*255).astype(np.uint8))
+    cv2.imwrite('iScr.png', (iScr*255).astype(np.uint8))
+    
+    
+    #img2 = (DanbooRegionGetRegion(S, model) * 255).clip(0,255).astype(np.uint8)
+    #cv2.imshow('1', img)
+    #cv2.imshow('2', img2)
+    #cv2.imwrite("o2.png", img2)
+    #cv2.waitKey(0)
+    #cv2.destroyAllWindows()

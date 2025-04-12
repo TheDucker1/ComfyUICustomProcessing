@@ -182,74 +182,6 @@ class MangaLineExtractionModel(nn.Module):
 
         return y
 
-#class MyDataset(Dataset):
-#    def __init__(self, image_paths, transform=None):
-#        self.image_paths = image_paths
-#        self.transform = transform
-#        
-#    def get_class_label(self, image_name):
-#        # your method here
-#        head, tail = os.path.split(image_name)
-#        #print(tail)
-#        return tail
-#        
-#    def __getitem__(self, index):
-#        image_path = self.image_paths[index]
-#        x = Image.open(image_path)
-#        y = self.get_class_label(image_path.split('/')[-1])
-#        if self.transform is not None:
-#            x = self.transform(x)
-#        return x, y
-#    
-#    def __len__(self):
-#        return len(self.image_paths)
-
-#def loadImages(folder):
-#    imgs = []
-#    matches = []
-#    for root, dirnames, filenames in os.walk(folder):
-#        for filename in fnmatch.filter(filenames, '*'):
-#            matches.append(os.path.join(root, filename))
-#   
-#    return matches
-
-#if __name__ == "__main__":
-#    model = res_skip()
-#    model.load_state_dict(torch.load('erika.pth'))
-#    is_cuda = torch.cuda.is_available()
-#    if is_cuda:
-#        model.cuda()
-#    else:
-#        model.cpu()
-#    model.eval()
-#    
-#    filelists = loadImages(sys.argv[1])
-#
-#    with torch.no_grad():
-#        for imname in filelists:
-#            src = cv2.imread(imname,cv2.IMREAD_GRAYSCALE)
-#            
-#            rows = int(np.ceil(src.shape[0]/16))*16
-#            cols = int(np.ceil(src.shape[1]/16))*16
-#            
-#            # manually construct a batch. You can change it based on your usecases. 
-#            patch = np.ones((1,1,rows,cols),dtype="float32")
-#            patch[0,0,0:src.shape[0],0:src.shape[1]] = src
-#            
-#            if is_cuda: 
-#                tensor = torch.from_numpy(patch).cuda()
-#            else:
-#                tensor = torch.from_numpy(patch).cpu()
-#            y = model(tensor)
-#            print(imname, torch.max(y), torch.min(y))
-#
-#            yc = y.cpu().numpy()[0,0,:,:]
-#            yc[yc>255] = 255
-#            yc[yc<0] = 0
-#
-#            head, tail = os.path.split(imname)
-#            cv2.imwrite(sys.argv[2]+"/"+tail.replace(".jpg",".png"),yc[0:src.shape[0],0:src.shape[1]])
-
 def MangaLineExtract(img_batch, model):
     B, H, W, C = img_batch.shape
     if C == 3:
@@ -274,3 +206,15 @@ def MangaLineModelLoad(model_path):
     model.load_state_dict(torch.load(model_path))
     model.eval()
     return model
+    
+if __name__ == '__main__':
+    import cv2 
+    model_path = '../../../models/extra/erika.pth'
+    model = MangaLineModelLoad(model_path)
+    img = cv2.imread('06.jpg', cv2.IMREAD_GRAYSCALE)
+    img_batch = img.copy()
+    img_batch = img_batch[np.newaxis,...,np.newaxis]
+    img_batch = img_batch.astype(np.float32) / 255
+    img2 = MangaLineExtract(torch.from_numpy(img_batch), model).numpy()[0][:,:,0]
+    img2 = (img2*255).clip(0,255).astype(np.uint8)
+    cv2.imwrite('06-out.png', img2)
