@@ -1,499 +1,377 @@
-import numpy as np
-import cv2
-import scipy.linalg
-import scipy.sparse.linalg
-import numba
-from numba.typed import List
+import math
 from typing import Optional
-from .graphbasedsegmentation import GraphBasedSegmentation
+
+import cv2
+import numba
+import numpy as np
 from numba import prange
+from scipy.sparse.linalg import LinearOperator, cg
+
+from .graphbasedsegmentation import GraphBasedSegmentation
+
+
+def _local_stencil(height, width, radius, use_gradient):
+    # Keep only the orientation with a positive flattened offset.
+    offsets = np.array([
+        (dy, dx)
+        for dy in range(min(radius, height - 1) + 1)
+        for dx in range(-min(radius, width - 1), min(radius, width - 1) + 1)
+        if dy > 0 or dx > 0
+    ], dtype=np.int32).reshape(-1, 2)
+    strides = offsets[:, 0].astype(np.int64) * width + offsets[:, 1]
+
+    paths = np.zeros((len(offsets), radius + 1, 2), dtype=np.int32)
+    if use_gradient:
+        for k, (dy, dx) in enumerate(offsets):
+            steps = max(dy, abs(dx))
+            for step in range(steps + 1):
+                paths[k, step] = (round(dy * step / steps), round(dx * step / steps))
+    return offsets, strides, paths
+
+
+def _reflection_counts(length, radius):
+    # Count BORDER_REFLECT_101 offsets that land on each actual displacement.
+    counts = np.zeros((length, 2 * radius + 1), dtype=np.int32)
+    positions = np.arange(length)
+    for offset in range(-radius, radius + 1):
+        if length == 1:
+            reflected = positions
+        else:
+            period = 2 * (length - 1)
+            wrapped = (positions + offset) % period
+            reflected = np.minimum(wrapped, period - wrapped)
+        counts[positions, reflected - positions + radius] += 1
+    return counts
+
+
+@numba.njit(inline="always")
+def _multiplicity(source, dest, width, radius, counts_y, counts_x):
+    sy, sx = divmod(source, width)
+    dy, dx = divmod(dest, width)
+    y_offset, x_offset = dy - sy, dx - sx
+    forward = counts_y[sy, radius + y_offset] * counts_x[sx, radius + x_offset]
+    reverse = counts_y[dy, radius - y_offset] * counts_x[dx, radius - x_offset]
+    return forward + reverse
+
+
+@numba.njit(inline="always")
+def _distance_squared(features, source, dest):
+    distance = 0.0
+    for channel in range(features.shape[1]):
+        diff = features[source, channel] - features[dest, channel]
+        distance += diff * diff
+    return distance
+
+
+@numba.njit(inline="always")
+def _affinity(distance, sigma_squared):
+    if sigma_squared == 0:
+        return 1.0 if distance == 0 else 0.0
+    return math.exp(-0.5 * distance / sigma_squared)
+
+
+@numba.njit(parallel=True)
+def _local_weights(features, gradient_squared, offsets, strides, paths, width,
+                   radius, counts_y, counts_x, eta, sigma_squared):
+    height = counts_y.shape[0]
+    weights = np.zeros((height * width, len(strides)), dtype=np.float32)
+    for pixel in prange(height * width):
+        source = np.int64(pixel)
+        y, x = divmod(source, width)
+        for k in range(len(strides)):
+            dy, dx = offsets[k]
+            if y + dy >= height or not 0 <= x + dx < width:
+                continue
+            dest = source + strides[k]
+            distance = _distance_squared(features, source, dest)
+            if gradient_squared.size:
+                peak = 0.0
+                for step in range(max(dy, abs(dx)) + 1):
+                    py, px = paths[k, step]
+                    peak = max(peak, gradient_squared[y + py, x + px])
+                distance = max(distance, eta * peak)
+            multiplicity = _multiplicity(source, dest, width, radius, counts_y, counts_x)
+            weights[source, k] = math.sqrt(multiplicity) * _affinity(distance, sigma_squared)
+    return weights
+
+
+@numba.njit(parallel=True)
+def _reduce_local(weights, strides, width, radius, counts_y, counts_x, scratch,
+                  block_size, scale, z, dual, shrink_limit):
+    """Reduce the diagonal, normal product, or next split-Bregman right-hand side."""
+    size = weights.shape[0]
+    block_errors = np.empty(scratch.shape[0], dtype=np.float64)
+    for block in prange(scratch.shape[0]):
+        start = np.int64(block) * block_size
+        partial = scratch[block]
+        partial.fill(0)
+        block_error = 0.0
+        for source in range(start, min(start + block_size, size)):
+            total = 0.0
+            for k in range(len(strides)):
+                weight = np.float64(weights[source, k])
+                if weight == 0:
+                    continue
+                dest = source + strides[k]
+                if dual is not None:
+                    # Fold identical rows (including reverse orientations) into one.
+                    # Multiplicity m scales both the row and shrink threshold by sqrt(m).
+                    limit = shrink_limit * math.sqrt(
+                        _multiplicity(source, dest, width, radius, counts_y, counts_x)
+                    )
+                    old_dual = dual[source, k]
+                    q = weight * (z[source] - z[dest]) + old_dual
+                    dual[source, k] = min(max(q, -limit), limit)
+                    change = dual[source, k] - old_dual
+                    block_error += change * change
+                    # b' = clip(q), d' = q - b', so d' - b' = q - 2b'.
+                    value = weight * (q - 2 * dual[source, k])
+                else:
+                    value = weight * weight
+                    if z is not None:
+                        value *= z[source] - z[dest]
+                total += value
+                if z is None:
+                    partial[dest - start] += value
+                else:
+                    partial[dest - start] -= value
+            partial[source - start] += total
+        block_errors[block] = block_error
+
+    # Each block scatters into its own buffer. A pixel can also receive
+    # contributions from the preceding block's halo, which is at most one block.
+    result = np.empty(size, dtype=np.float64)
+    for pixel in prange(size):
+        block, index = divmod(np.int64(pixel), block_size)
+        value = scratch[block, index]
+        if block > 0 and index + block_size < scratch.shape[1]:
+            value += scratch[block - 1, index + block_size]
+        result[pixel] = scale * value
+    primal_error = 0.0
+    for block_error in block_errors:
+        primal_error += block_error
+    return result, primal_error
+
 
 @numba.njit
-def DrawLine(x1: int, y1: int, x2: int, y2: int) -> List[tuple[int,int]]:
-    dx = x2 - x1
-    dy = y2 - y1
-    if dx == 0 and dy == 0:
-        return [(x1,y1)]
-    swap = abs(dx) < abs(dy)
-    if swap:
-        x1,y1=y1,x1
-        x2,y2=y2,x2
-        dx,dy=dy,dx
-    m = abs(dy/dx)
-    m *= -1 if y2 < y1 else 1
-    xx = x1
-    yy : float = y1
-    direction = -1 if x1>x2 else 1
-    result = [(xx,int(yy))]
-    while xx != x2:
-        xx += direction
-        yy += m
-        result.append((xx,round(yy))) # some inconsistency with negative number, but good enough
-    if swap:
-        result = [(y,x) for x,y in result]
-    return result
+def _representatives(pixels, labels, count):
+    channels = pixels.shape[1]
+    sums = np.zeros((count, channels), dtype=np.float64)
+    sizes = np.zeros(count, dtype=np.int64)
+    for index, label in enumerate(labels):
+        sizes[label] += 1
+        for channel in range(channels):
+            sums[label, channel] += pixels[index, channel]
+    for label in range(count):
+        sums[label] /= sizes[label]
 
-@numba.njit(parallel=True)
-def construct_LTL_ijv(lab: np.ndarray, 
-    edge_preserving: int,
-    grad: np.ndarray, 
-    half_window: int,
-    presearch_window: List[List[tuple[int,int]]],
-    eta: float,
-    sigma: float,
-    row: np.ndarray,
-    col: np.ndarray,
-    val: np.ndarray
-    ):
+    closest = np.full(count, np.inf)
+    representatives = np.empty(count, dtype=np.int64)
+    for index, label in enumerate(labels):
+        distance = 0.0
+        for channel in range(channels):
+            diff = pixels[index, channel] - sums[label, channel]
+            distance += diff * diff
+        if distance < closest[label]:
+            closest[label] = distance
+            representatives[label] = index
+    return representatives
 
-    wsize = (half_window*2+1)
-    w2size = wsize*wsize
 
-    h, w = lab.shape[:2]
-    sig2ma = 1/sigma/sigma/2
-    def fixi(i: int):
-        if i < 0:
-            i = -i
-        elif i >= h:
-            i = h-2 - (i-h)
-        return i
-    def fixj(j: int):
-        if j < 0:
-            j = -j
-        elif j >= w:
-            j = w-2 - (j-w)
-        return j
-    def getidx(i: int, j: int):
-        return i*w+j
-    
-    for i in prange(h):
-        for j in prange(w):
-            for di in prange(-half_window, half_window+1):
-                for dj in prange(-half_window, half_window+1):
-                    didx = (di+half_window)*wsize + (dj+half_window)
-                    max_grad = 0
-                    if edge_preserving:
-                        for ddi, ddj in presearch_window[didx]:
-                            ni, nj = fixi(i+ddi), fixj(j+ddj)
-                            _grad = grad[ni,nj]
-                            if _grad > max_grad:
-                                max_grad = _grad
-                    ni, nj = fixi(i+di), fixj(j+dj)
-                    ww: float = max(eta * max_grad * max_grad, np.dot(lab[ni,nj]-lab[i,j], lab[ni,nj]-lab[i,j]))
-                    ww = np.exp(-ww*sig2ma)
+@numba.njit
+def _global_weights(features, source, dest, sigma_squared):
+    weights = np.empty(len(source), dtype=np.float64)
+    for k in range(len(source)):
+        distance = _distance_squared(features, source[k], dest[k])
+        # The paper's global energy counts both orientations.
+        weights[k] = math.sqrt(2.0) * _affinity(distance, sigma_squared)
+    return weights
 
-                    idx = ((i*w+j)*w2size + didx) * 4
 
-                    row[idx] = getidx(i,j)
-                    col[idx] = getidx(i,j)
-                    val[idx] = ww*ww
+def L1Smooth(img: np.ndarray,
+             alpha: float = 50.0,
+             beta: float = 5.0,
+             gamma: float = 2.5,
+             _lambda: float = 5.0,
+             maxIter: int = 4,
+             kappa: float = 0.3,
+             sigma: float = 1,
+             half_window: int = 3,
+             eta: float = 15,
+             edge_preserving: int = 0,
+             global_size: int = 20,
+             threshold: float = 0.001,
+             msk: Optional[np.ndarray] = None,
+             *,
+             rgb: bool = False):
+    """Flatten a grayscale or BGR image in [0, 1], or RGB with rgb=True.
 
-                    row[idx+1] = getidx(ni,nj)
-                    col[idx+1] = getidx(ni,nj)
-                    val[idx+1] = ww*ww
-                        
-                    row[idx+2] = getidx(i,j)
-                    col[idx+2] = getidx(ni,nj)
-                    val[idx+2] = -ww*ww
+    Alpha and beta weight the local and global L1 terms. Gamma weights
+    fidelity, with a mask of 1 removing fidelity at that pixel.
+    """
+    img = np.asarray(img, dtype=np.float32)
+    if img.ndim == 3 and img.shape[2] == 1:
+        img = img[..., 0]
+    if img.ndim != 2 and (img.ndim != 3 or img.shape[2] != 3):
+        raise ValueError("L1 smoothing expects a grayscale or three-channel image")
+    height, width = img.shape[:2]
+    size = height * width
+    if not size:
+        raise ValueError("L1 smoothing expects a nonempty image")
+    settings = (alpha, beta, gamma, _lambda, kappa, sigma, eta, threshold)
+    if any(not math.isfinite(value) or value < 0 for value in settings):
+        raise ValueError("L1 smoothing weights and threshold must be finite and nonnegative")
+    if half_window < 0 or maxIter < 0 or global_size < 1:
+        raise ValueError("Invalid L1 smoothing window, iteration count, or superpixel limit")
 
-                    row[idx+3] = getidx(ni,nj)
-                    col[idx+3] = getidx(i,j)
-                    val[idx+3] = -ww*ww
+    beta = 0.0 if edge_preserving else beta
+    if not maxIter or not _lambda or (not (alpha and half_window) and not beta):
+        return img.copy()
 
-@numba.njit(parallel=True)
-def construct_GTG_ijv(lab: np.ndarray,
-    superpixels: np.ndarray,
-    sigma: float,
-    row: np.ndarray,
-    col: np.ndarray,
-    val: np.ndarray
-    ):
-    h, w = lab.shape[:2]
-    sig2ma = 1/sigma/sigma/2
-    n = superpixels.shape[0]
-    def getidx(i: int, j: int):
-        return i*w+j
-    for i in prange(n):
-        y1, x1 = superpixels[i]
-        for j in prange(n):
-            if j == i:
-                continue
-            idx = (i*(n-1)+j)*4
-            y2, x2 = superpixels[j]
-            WW = lab[y1,x1]-lab[y2,x2]
-            ww: float = np.dot(WW, WW)
-            ww = np.exp(-ww*sig2ma)
-            
-            row[idx] = getidx(y1,x1)
-            col[idx] = getidx(y1,x1)
-            val[idx] = ww*ww
-
-            row[idx+1] = getidx(y2,x2)
-            col[idx+1] = getidx(y2,x2)
-            val[idx+1] = ww*ww
-
-            row[idx+2] = getidx(y1,x1)
-            col[idx+2] = getidx(y2,x2)
-            val[idx+2] = -ww*ww
-
-            row[idx+3] = getidx(y2,x2)
-            col[idx+3] = getidx(y1,x1)
-            val[idx+3] = -ww*ww
-    
-@numba.njit(parallel=True)
-def compute_LTdb(lab: np.ndarray,
-    edge_preserving: int,
-    grad: np.ndarray,
-    half_window: int,
-    presearch_window: List[List[tuple[int,int]]],
-    eta: float,
-    sigma: float,
-    db: np.ndarray,
-    data_out: np.ndarray):
-
-    wsize = (half_window*2+1)
-    w2size = wsize*wsize
-
-    h, w = lab.shape[:2]
-    data_out.fill(0)
-    sig2ma = 1/2/sigma/sigma
-    def fixi(i: int):
-        if i < 0:
-            i = -i
-        elif i >= h:
-            i = h-2 - (i-h)
-        return i
-    def fixj(j: int):
-        if j < 0:
-            j = -j
-        elif j >= w:
-            j = w-2 - (j-w)
-        return j
-    def getidx(i: int, j: int):
-        return i*w+j
-    
-    for i in prange(h):
-        for j in prange(w):
-            for di in prange(-half_window, half_window+1):
-                for dj in prange(-half_window, half_window+1):
-                    didx = (di+half_window)*wsize + (dj+half_window)
-                    max_grad = 0
-                    if edge_preserving:
-                        for ddi, ddj in presearch_window[didx]:
-                            ni, nj = fixi(i+ddi), fixj(j+ddj)
-                            _grad = grad[ni,nj]
-                            if _grad > max_grad:
-                                max_grad = _grad
-                    ni, nj = fixi(i+di), fixj(j+dj)
-                    ww: float = max(eta * max_grad * max_grad, np.dot(lab[ni,nj]-lab[i,j], lab[ni,nj]-lab[i,j]))
-                    ww = np.exp(-ww*sig2ma)
-
-                    kidx = (i*w+j)*w2size + didx
-
-                    idx1: int = getidx(i, j)
-                    data_out[idx1] += ww * db[kidx]
-                    idx2: int = getidx(ni, nj)
-                    data_out[idx2] += -ww * db[kidx]
-
-@numba.njit(parallel=True)
-def compute_GTdb(lab: np.ndarray,
-    superpixels: np.ndarray,
-    sigma: float,
-    db: np.ndarray,
-    data_out: np.ndarray):
-    h, w = lab.shape[:2]
-    data_out.fill(0)
-    sig2ma = 1/sigma/sigma/2
-    n = superpixels.shape[0]
-    def getidx(i: int, j: int):
-        return i*w+j
-    for i in prange(n):
-        y1, x1 = superpixels[i]
-        for j in prange(n):
-            if j == i:
-                continue
-            y2, x2 = superpixels[j]
-            kidx = i * (n-1) + j
-
-            WW = lab[y1,x1]-lab[y2,x2]
-            ww: float = np.dot(WW,WW)
-            ww = np.exp(-ww*sig2ma)
-
-            idx1: int = getidx(y1,x1)
-            data_out[idx1] += ww * db[kidx]
-            idx2: int = getidx(y2,x2)
-            data_out[idx2] -= ww * db[kidx]
-
-@numba.njit(parallel=True)
-def compute_Lz(lab:np.ndarray,
-    edge_preserving: int,
-    grad: np.ndarray,
-    half_window: int,
-    presearch_window: np.ndarray,
-    eta: float,
-    sigma: float,
-    z: np.ndarray,
-    data_out: np.ndarray):
-
-    wsize = (half_window*2+1)
-    w2size = wsize*wsize
-
-    h, w = lab.shape[:2]
-    data_out.fill(0)
-    sig2ma = 1/2/sigma/sigma
-    def fixi(i: int):
-        if i < 0:
-            i = -i
-        elif i >= h:
-            i = h-2 - (i-h)
-        return i
-    def fixj(j: int):
-        if j < 0:
-            j = -j
-        elif j >= w:
-            j = w-2 - (j-w)
-        return j
-    def getidx(i: int, j: int):
-        return i*w+j
-
-    for i in prange(h):
-        for j in prange(w):
-            for di in prange(-half_window, half_window+1):
-                for dj in prange(-half_window, half_window+1):
-                    max_grad = 0
-                    didx = (di+half_window)*wsize + (dj+half_window)
-                    if edge_preserving:
-                        for ddi, ddj in presearch_window[didx]:
-                            ni, nj = fixi(i+ddi), fixj(j+ddj)
-                            _grad = grad[ni,nj]
-                            if _grad > max_grad:
-                                max_grad = _grad
-                    ni, nj = fixi(i+di), fixj(j+dj)
-                    ww: float = max(eta * max_grad * max_grad, np.dot(lab[ni,nj]-lab[i,j], lab[ni,nj]-lab[i,j]))
-                    ww = np.exp(-ww*sig2ma)
-
-                    kidx = (i*w+j)*w2size + didx
-
-                    idx1: int = getidx(i, j)
-                    data_out[kidx] += ww * z[idx1]
-                    idx2: int = getidx(ni, nj)
-                    data_out[kidx] += -ww * z[idx2]
-
-@numba.njit(parallel=True)
-def compute_Gz(lab: np.ndarray,
-    superpixels: np.ndarray,
-    sigma: float,
-    z: np.ndarray,
-    data_out: np.ndarray):
-
-    h, w = lab.shape[:2]
-    data_out.fill(0)
-    sig2ma = 1/sigma/sigma/2
-    n = superpixels.shape[0]
-    def getidx(i: int, j: int):
-        return i*w+j
-    for i in prange(n):
-        y1, x1 = superpixels[i]
-        for j in prange(n):
-            if j == i:
-                continue
-            y2, x2 = superpixels[j]
-            kidx = i * (n-1) + j
-
-            WW = lab[y1,x1]-lab[y2,x2]
-            ww: float = np.dot(WW, WW)
-            ww = np.exp(-ww*sig2ma)
-
-            idx1: int = getidx(y1,x1)
-            idx2: int = getidx(y2,x2)
-
-            data_out[kidx] += ww * (z[idx1]-z[idx2])
-
-# https://stackoverflow.com/a/17678303
-def find_nearest_vector(array, value):
-    idx = np.array([np.linalg.norm(array-value, axis=-1)]).argmin()
-    return idx
-
-def L1Smooth(img: np.ndarray, 
-            alpha: float = 50.0, # local weight
-            beta: float = 5.0, # global weight (if not edge-preserve)
-            gamma: float = 2.5, # approximate
-            _lambda: float = 5.0, # regulation
-            maxIter: int = 4, # maximum iteration step
-            kappa: float = 0.3, # L weight in LAB
-            sigma: float = 1, # lab weight
-            half_window: int = 3, # half window size
-
-            eta: float = 15, # gradient weight in edge preserving mode
-            edge_preserving: int = 0, # enable edge preserving mode (ignore global if true)
-
-            global_size: int = 20, # max global superpixels
-            threshold: float = 0.001,
-            msk: Optional[np.ndarray] = None,
-    ):
-    h, w = img.shape[:2]
-    c = 1 if len(img.shape) < 3 else img.shape[2]
-    tot_size = h*w
-    w_size = (half_window*2+1)**2
-
-    if edge_preserving:
-        presearch_window = [[] for _ in range((half_window*2+1)**2)]
-        idx = 0
-        for di in range(-half_window, half_window+1):
-            for dj in range(-half_window, half_window+1):
-                presearch_window[idx] = List(DrawLine(0,0,di,dj))
-                
-                idx += 1
-        presearch_window = List(presearch_window)
-    else:
-        presearch_window = List([List([(0,0)]) for _ in range(1)])
-    
-    if edge_preserving:
-        if c == 1:
-            imggray = img.copy()
-        else:
-            imggray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        smooth = cv2.GaussianBlur(imggray, (3,3), 0)
-        grad_x = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_REFLECT101)
-        grad_y = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_REFLECT101)
-        grad = np.sqrt(grad_x * grad_x + grad_y * grad_y)
-    else:
-        grad = np.array([[1]], dtype=np.float32)
-    if c == 1:
-        lab = cv2.merge([img * kappa, np.zeros_like(img), np.zeros_like(img)])
-    else:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        l *= kappa
-        lab = cv2.merge([l,a,b])
-
-    rowL = np.zeros((tot_size*w_size*4), dtype=np.int32)
-    colL = np.zeros((tot_size*w_size*4), dtype=np.int32)
-    valL = np.zeros((tot_size*w_size*4), dtype=np.float32)
-    construct_LTL_ijv(lab,edge_preserving,grad,half_window,presearch_window,eta,sigma,rowL,colL,valL)
-    valL *= alpha
-
+    fidelity = np.full(size, gamma, dtype=np.float64)
     if msk is not None:
-        rowI = np.array([i for i in range(tot_size)], dtype=np.int32)
-        colI = np.array([i for i in range(tot_size)], dtype=np.int32)
-        valI = (img.flatten() * (1 - msk.flatten())).astype(np.float32)
+        mask = np.asarray(msk, dtype=np.float64)
+        if mask.shape == (height, width, 1):
+            mask = mask[..., 0]
+        if mask.shape not in ((height, width), (size,)) or not np.all((mask >= 0) & (mask <= 1)):
+            raise ValueError("L1 smoothing mask must match the image and have values in [0, 1]")
+        fidelity *= 1 - mask.ravel()
+
+    color = img.ndim == 3
+    channels = 3 if color else 1
+    target = img.reshape(size, channels)
+    if color:
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB if rgb else cv2.COLOR_BGR2LAB)
+        lab[..., 0] /= 100.0
+        lab[..., 1:] /= 255.0
     else:
-        rowI = np.array([i for i in range(tot_size)], dtype=np.int32)
-        colI = np.array([i for i in range(tot_size)], dtype=np.int32)
-        valI = np.array([1.0] * tot_size, dtype=np.float32)
-    valI *= gamma
+        lab = img[..., None].copy()
 
-    if not edge_preserving:
-        global_segmentation, global_real_size = GraphBasedSegmentation(img, 0.5, 500, global_size)
-        superpixels = []
-        for i in range(global_real_size):
-            repmsk = global_segmentation==i
-            if c == 3:
-                repmsk = repmsk[..., np.newaxis]
-                repmsk = np.repeat(repmsk, 3, axis=2)
-            img_seg = np.ma.masked_where(repmsk, img)
-            avg_col = np.mean(img_seg, axis=(0,1))
-            rep_pixel = find_nearest_vector(img_seg, avg_col)
-            rep_h = rep_pixel // w
-            rep_w = rep_pixel % w
-            superpixels.append((h,w))
-        superpixels = np.array(superpixels)
-        rowG = np.zeros((global_real_size * (global_real_size-1)), dtype=np.int32)
-        colG = np.zeros((global_real_size * (global_real_size-1)), dtype=np.int32)
-        valG = np.zeros((global_real_size * (global_real_size-1)), dtype=np.float32)
-        construct_GTG_ijv(lab,superpixels,sigma,rowG,colG,valG)
-        valG *= beta
+    if beta:
+        # Segmentation's K is in 8-bit color units. Keep the segmentation
+        # lightness weighting independent of the affinity's kappa.
+        segmentation_features = lab * 255.0
+        if color:
+            segmentation_features[..., 0] *= 0.3
+        labels, count = GraphBasedSegmentation(segmentation_features, 0.5, 500, global_size)
+        representatives = _representatives(target, labels.ravel(), count)
+        del segmentation_features, labels
+        first, second = np.triu_indices(count, k=1)
+        source, dest = representatives[first], representatives[second]
     else:
-        superpixels = np.array([(1,1)], dtype=np.int32)
+        source = dest = np.empty(0, dtype=np.int64)
 
-    row = (rowG, rowL, rowI) if not edge_preserving else (rowL, rowI)
-    col = (colG, colL, colI) if not edge_preserving else (colL, colI)
-    val = (valG, valL, valI) if not edge_preserving else (valL, valI)
+    lab[..., 0] *= kappa
+    features = lab.reshape(size, channels)
+    sigma_squared = sigma * sigma
+    global_weights = _global_weights(features, source, dest, sigma_squared)
 
-    row = np.concatenate(row)
-    col = np.concatenate(col)
-    val = np.concatenate(val)
-    A = scipy.sparse.coo_matrix((val, (row,col)), shape=(tot_size, tot_size))
-    
-    zIn = []
-    if c == 1:
-        if msk is not None:
-            zIn.append(np.ravel(img) * (1 - msk.flatten()))
-        else:
-            zIn.append(np.ravel(img))
+    radius = half_window if alpha else 0
+    use_gradient = bool(edge_preserving and eta and radius)
+    offsets, strides, paths = _local_stencil(height, width, radius, use_gradient)
+    counts_y = _reflection_counts(height, radius)
+    counts_x = _reflection_counts(width, radius)
+    if use_gradient:
+        # Sobel of the channel mean is the mean of the channel Sobel gradients.
+        gray = img.mean(axis=2) if color else img
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, borderType=cv2.BORDER_REFLECT_101)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, borderType=cv2.BORDER_REFLECT_101)
+        gradient_squared = gx * gx + gy * gy
+        del gray, gx, gy
     else:
-        for x in cv2.split(img):
-            if msk is not None:
-                zIn.append(np.ravel(x) * (1 - msk.flatten()))
-            else:
-                zIn.append(np.ravel(x))
-    zOut = [zin.copy() for zin in zIn]
-    zOut2 = [zin.copy() for zin in zIn]
+        gradient_squared = np.empty((0, 0), dtype=np.float32)
+    local_weights = _local_weights(
+        features, gradient_squared, offsets, strides, paths, width, radius,
+        counts_y, counts_x, eta, sigma_squared,
+    )
+    del features, lab, gradient_squared
+    halo = int(strides[-1]) if len(strides) else 0
+    block_size = max(halo, 1024)
+    blocks = (size + block_size - 1) // block_size
+    scratch = np.empty((blocks, block_size + halo), dtype=np.float64)
 
-    d1 = [np.zeros((tot_size*w_size), dtype=np.float32) for _ in range(c)]
-    b1 = [np.zeros_like(dx) for dx in d1]
+    # Use penalties lambda*alpha and lambda*beta for the two splits.
+    # This gives the weighted L1 objective with a common 1/lambda shrink limit.
+    local_scale, global_scale = _lambda * alpha, _lambda * beta
+    shrink_limit = 1.0 / _lambda
+    global_normal = global_scale * global_weights**2
 
-    if not edge_preserving:
-        d2 = [np.zeros(global_real_size*(global_real_size-1), dtype=np.float32) for _ in range(c)]
-        b2 = [np.zeros_like(dx) for dx in d2]
-    
-    def Shrink(y, _gamma):
-        ind = y < 0
-        y = np.abs(y) - _gamma
-        y[y<0] = 0
-        y[ind] *= -1
-        return y
-    
-    dd1 = np.zeros_like(d1[0])
-    bb1 = np.zeros_like(b1[0])
-    db1 = np.zeros_like(zIn[0])
-    Lz = np.zeros_like(d1[0])
-    if not edge_preserving:
-        dd2 = np.zeros_like(d2[0])
-        bb2 = np.zeros_like(b2[0])
-        db2 = np.zeros_like(zIn[0])
-        Gz = np.zeros_like(d2[0])
-    for _ in range(maxIter):
-        zDiff = 0
-        for i in range(c):
-            compute_LTdb(lab, edge_preserving, grad, half_window, presearch_window, eta, sigma, d1[i]-b1[i], db1)
-            if not edge_preserving:
-                compute_GTdb(lab, superpixels, sigma, d2[i]-b2[i], db2)
-                v = gamma * zIn[i] + _lambda * db1 + db2
-            else:
-                v = gamma * zIn[i] + _lambda * db1
-            zOut2[i], _ = scipy.sparse.linalg.cg(A, v)
-            zDiff += np.dot(zOut2[i] - zOut[i], zOut2[i] - zOut[i])
-            zOut[i] = zOut2[i].copy()
-        if zDiff <= threshold:
-            break
-        for i in range(c):
-            compute_Lz(lab, edge_preserving, grad, half_window, presearch_window, eta, sigma, zOut[i], Lz)
-            dd1 = Shrink(Lz + b1[i], 1 / _lambda)
-            bb1 = Lz + b1[i] - dd1
-            d1[i] = dd1.copy()
-            b1[i] = bb1.copy()
+    def reduce_local(z=None, dual=None):
+        if not len(strides):
+            return np.zeros(size, dtype=np.float64), 0.0
+        return _reduce_local(
+            local_weights, strides, width, radius, counts_y, counts_x, scratch,
+            block_size, local_scale, z, dual, shrink_limit,
+        )
 
-            if not edge_preserving:
-                compute_Gz(lab, superpixels, sigma, zOut[i], Gz)
-                dd2 = Shrink(Gz + b2[i], 1 / _lambda)
-                bb2 = Gz + b2[i] - dd2
-                d2[i] = dd2.copy()
-                b2[i] = bb2.copy()
-    if c == 3:
-        img2 = cv2.merge([x.reshape((h,w)) for x in zOut])
-    else:
-        img2 = zOut[0].reshape((h,w))
-    return img2
+    diagonal, _ = reduce_local()
+    np.add.at(diagonal, source, global_normal)
+    np.add.at(diagonal, dest, global_normal)
+    connected = diagonal > 0
+    if not connected.any():
+        return img.copy()
+    diagonal += fidelity
+    free = diagonal == 0
+    if not fidelity.any():
+        # A constant minimizes both sparsity terms when there is no fidelity.
+        result = target.copy()
+        result[connected] = target[connected].mean(axis=0)
+        return result.reshape(img.shape)
+    diagonal[free] = 1.0
+
+    def matvec(z):
+        z = z.ravel()
+        out, _ = reduce_local(z)
+        values = global_normal * (z[source] - z[dest])
+        np.add.at(out, source, values)
+        np.add.at(out, dest, -values)
+        out += fidelity * z
+        return out
+
+    normal = LinearOperator((size, size), matvec=matvec, dtype=np.float64)
+    preconditioner = LinearOperator(
+        (size, size), matvec=lambda z: z.ravel() / diagonal, dtype=np.float64,
+    )
+    result = np.empty_like(target)
+    local_dual = np.empty_like(local_weights)
+    for channel in range(channels):
+        local_dual.fill(0)
+        global_dual = np.zeros_like(global_weights)
+        original = target[:, channel].astype(np.float64)
+        data_rhs = fidelity * original
+        rhs = data_rhs
+        z = original
+        for iteration in range(maxIter):
+            previous = z
+            z, info = cg(normal, rhs, x0=previous, M=preconditioner)
+            if info or not np.isfinite(z).all():
+                raise RuntimeError(f"L1 smoothing conjugate gradient failed (info={info})")
+            z[free] = original[free]
+            if iteration + 1 == maxIter:
+                break
+
+            rhs, primal_error = reduce_local(z, local_dual)
+            q = global_weights * (z[source] - z[dest]) + global_dual
+            new_dual = np.clip(q, -math.sqrt(2.0) * shrink_limit, math.sqrt(2.0) * shrink_limit)
+            dual_change = new_dual - global_dual
+            primal_error += np.dot(dual_change, dual_change)
+            global_dual = new_dual
+            if max(np.dot(z - previous, z - previous), primal_error) <= threshold / channels:
+                break
+
+            values = global_scale * global_weights * (q - 2 * global_dual)
+            np.add.at(rhs, source, values)
+            np.add.at(rhs, dest, -values)
+            rhs += data_rhs
+        result[:, channel] = z
+    return result.reshape(img.shape)
 
 
 if __name__ == '__main__':
     img = cv2.imread('bg.png', cv2.IMREAD_COLOR)
-    img = cv2.resize(img, (300,300))
-    h,w,c = img.shape[:3]
-    S = img.astype(np.float32) / 255.
-    img2 = L1Smooth(S, edge_preserving=1)
-    img2 = (img2*255).clip(0,255).astype(np.uint8)
+    img = cv2.resize(img, (300, 300))
+    img2 = L1Smooth(img.astype(np.float32) / 255.0, edge_preserving=1)
+    img2 = (img2 * 255).clip(0, 255).astype(np.uint8)
     cv2.imshow('1', img)
     cv2.imshow('2', img2)
     cv2.waitKey(0)

@@ -471,14 +471,19 @@ class L1Smoother:
     CATEGORY = "examples"
     FUNCTION = "l1smooth"
 
-    def l1smooth(self, images, is_grayscale, edge_preserving, alpha, beta, gamma, _lambda, maxIteration, kappa, sigma, half_window, eta, global_size, threshold):
+    def l1smooth(self, images, is_grayscale=0, edge_preserving=0, alpha=50.0,
+                 beta=5.0, gamma=2.5, _lambda=5.0, maxIteration=5, kappa=3.0,
+                 sigma=1.0, half_window=3, eta=15.0, global_size=20, threshold=0.1):
         images = images.cpu()
         L = []
         for i in range(images.shape[0]):
             img = images[i].numpy().copy()
             if is_grayscale:
                 img = img[:,:,0]
-            img = L1Smooth(img, alpha, beta, gamma, _lambda, maxIteration, kappa, sigma, half_window, eta, edge_preserving, global_size, threshold)
+            img = L1Smooth(
+                img, alpha, beta, gamma, _lambda, maxIteration, kappa, sigma,
+                half_window, eta, edge_preserving, global_size, threshold, rgb=True,
+            )
             if is_grayscale:
                 if len(img.shape) < 3:
                     img = img[:,:,np.newaxis]
